@@ -1,0 +1,128 @@
+name: Simple-service-app-merge-to-master
+
+on:
+  # Triggers the workflow on push  request events but only for the "master" branch
+  push:
+    branches: [ "master" ]
+
+
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+      KUBE_SECRET: ${{ secrets.KUBE_SECRET }}
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+        name: Checking out the code base
+        with:
+          path: code-path
+          
+      - name: Checkout template repo
+        uses: actions/checkout@v3
+        with:
+          repository:  raul3520/yaml_repo
+          token: ${{ secrets.PAT }}
+          path: template-path
+        
+          
+      - name: Set latest Commit hash as the tag
+        id: tag
+        shell: bash
+        run: |
+          cd code-path
+          echo $(git rev-parse --short HEAD)
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+          echo "::set-output name=tagname::$(date '+%Y%m')-${{ github.run_number }}-$(git rev-parse --short HEAD)"
+
+      - name: Run basic test
+        run: |
+          mkdir testdir
+          cp -r  code-path/* testdir
+          cd testdir
+          echo "Running basic sanity test"
+          go build main.go
+          nohup ./main &
+          process=`netstat -anp |grep 8000|wc -l`
+          echo $process
+          if [ $process -eq 1 ]
+          then
+            echo "Process is running"
+          else
+            echo "Process is not running,So Exiting the job"
+            exit 1
+          fi
+      - name: Authenticate to Google container registry
+        shell: bash
+        run: |
+          echo "GCR Authentication"
+          echo ${{ secrets.GCR_SECRET }} |base64 --decode |docker login -u _json_key --password-stdin \
+          https://gcr.io        
+          echo "Authenticated successfully"
+
+      - name: Build and push the image
+        run: |
+          ls        
+          cd code-path
+          ls
+          tag="${{ steps.tag.outputs.tagname }}"
+          echo $tag
+          docker build -t $REGISTRY_URL/simple-service:latest .
+          docker tag $REGISTRY_URL/simple-service:latest $REGISTRY_URL/simple-service:$tag
+          echo "Docker Image succesfully built"
+          docker images
+          docker push $REGISTRY_URL/simple-service:$tag
+          docker push $REGISTRY_URL/simple-service:latest
+          
+      - name: Clone and update the yaml files.
+        run: |
+            echo "Manifest repo updating with new image version"   
+            ls -lrth
+            tag="${{ steps.tag.outputs.tagname }}"
+            echo "New version  is $tag"
+            cd template-path/simple-service-hpa
+
+            
+            currentversion=`grep image simple-service-deployment.yaml|awk -F ":" '{print $3}'`  
+            echo "Existing version is $currentversion"
+            sed -i "s/$currentversion/$tag/g" simple-service-deployment.yaml
+            newversion=`grep -w "image" simple-service-deployment.yaml|awk -F ":" '{print $3}'`
+            echo "Newverion is $newversion"
+            echo "Pushing stage"
+
+            git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+
+            git add simple-service-deployment.yaml
+            git commit -m "Add changes in simple-service-hpa ,$newversion"
+            git push origin
+            echo "Pushed changes successfully"
+            
+            
+      - name: Deploying code.
+        run: |
+            echo "Deploying simple-service"
+            sudo apt-get update
+            sudo apt-get install -y apt-transport-https ca-certificates curl
+            sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+            echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+            sudo apt-get update
+            sudo apt install -y kubectl=1.22.13-00
+            mkdir -p $HOME/.kube
+            echo "$KUBE_SECRET" |base64 --decode >>$HOME/.kube/config
+            ls -lrth $HOME/.kube/config
+            sudo chown $(id -u):$(id -g) $HOME/.kube/config
+            chmod 755 $HOME/.kube/config
+            ls -lrth $HOME/.kube/config
+
+            sudo kubectl --kubeconfig $HOME/.kube/config get nodes
+            sudo kubectl --kubeconfig $HOME/.kube/config get pod
+            sudo kubectl --kubeconfig $HOME/.kube/config apply -f template-path/simple-service-hpa/simple-service-deployment.yaml
+            
+            
